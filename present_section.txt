@@ -1,0 +1,8 @@
+2.6Exercises
+Feed the image of the golden retriever into the horse-to-zebra model:
+What do you need to do to the image to prepare it?
+What does the output look like?
+Search the Hugging Face model hub for projects that provide pretrained models:
+How many models are available in the hub?
+Find an interesting-looking model on the Hugging Face model hub. Can you understand the purpose of the model from its documentation?
+Bookmark the project and come back after you’ve finished this book. Can you understand the implementation?

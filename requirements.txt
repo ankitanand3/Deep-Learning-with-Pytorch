@@ -1,0 +1,6 @@
+ipykernel
+torch
+torchvision
+diffusers
+transformers
+accelerate
