@@ -613,7 +613,469 @@ No architecture code is "zebra-specific" or "horse-specific." All domain knowled
 
 ---
 
-## 14. Precision Rules (Lessons from Mistakes)
+## 14. Tensor Internals — Storage, Offset, Stride (from Ch. 3.9.1)
+
+### The Core Mental Model
+
+A `Tensor` is **not** a self-contained block of numbers. It's a thin metadata wrapper over a flat 1D `Storage`.
+
+```
+Tensor = (storage, storage_offset, size, stride)
+```
+
+| Field | What it is |
+|-------|-----------|
+| `storage` | The actual flat 1D buffer of numbers in RAM |
+| `storage_offset` | Storage index where this tensor's first element lives |
+| `size` | Tuple of per-dimension lengths (a.k.a. `shape`) |
+| `stride` | Tuple of per-dimension **jump sizes in storage** |
+
+A 2D (or N-D) tensor *looks* multi-dimensional to the user, but in memory it's still a flat 1D array. The metadata defines how to **navigate** that flat array as if it were N-D.
+
+```
+Tensor (view)              Storage (flat 1D buffer)
+┌───────────────┐          ┌──────────────────────┐
+│ storage_offset│ ────────►│ [4.0, 1.0, 5.0, 3.0, │
+│ size          │          │  2.0, 1.0]           │
+│ stride        │          └──────────────────────┘
+└───────────────┘
+```
+
+### The Indexing Formula (the most important equation in PyTorch)
+
+```
+storage_index = storage_offset + Σ stride[d] * index[d]
+                                  d
+```
+
+Every n-dimensional index op reduces to this single line. Burn it in.
+
+**Example.** `points = torch.tensor([[4.0, 1.0], [5.0, 3.0], [2.0, 1.0]])`
+
+```
+storage:  [ 4.0 , 1.0 , 5.0 , 3.0 , 2.0 , 1.0 ]
+index:      0     1     2     3     4     5
+stride:    (2, 1)   storage_offset: 0   size: (3, 2)
+
+points[2, 1] → storage_offset + stride[0]*2 + stride[1]*1
+             = 0 + 2*2 + 1*1
+             = 5  →  storage[5] = 1.0  ✓
+```
+
+### What Stride Actually Means
+
+> `stride[d]` = **how many storage positions to skip when moving one step along dimension d.**
+
+Stride is **not** a coordinate. It's a jump size.
+
+```
+points (3 × 2), stride (2, 1):
+
+  step a row    → jump 2 in storage   (each row = 2 elements)
+  step a column → jump 1 in storage   (columns are adjacent)
+
+storage:  [ 4.0 , 1.0 , 5.0 , 3.0 , 2.0 , 1.0 ]
+            ▲           ▲           ▲
+            row 0       row 1       row 2
+            (jump 2 to advance one row)
+
+            ▲     ▲
+            col 0 col 1
+            (jump 1 to advance one column)
+```
+
+### Slicing = New Metadata, Same Storage (O(1))
+
+When you slice with **integer indexing**, that dimension is **locked** — its stride/size are dropped, and `storage_offset` advances by `stride[d] * k`.
+
+```
+new_storage_offset = old_storage_offset + stride[d] * (the integer you picked)
+new_size           = old_size with axis d removed
+new_stride         = old_stride with axis d removed
+```
+
+**Example.** `second_point = points[1]`
+
+```
+                  storage_offset    size      stride
+points    (2D):         0          (3, 2)     (2, 1)
+points[1] (1D):         2          (2,)       (1,)
+                        │                       │
+       row 1 starts at  ┘   col-stride survives ┘
+       storage[2]            (rows can't move anymore)
+```
+
+No data is copied. Slicing is `O(1)` regardless of tensor size — only three small numbers change.
+
+### Slice with `:` (keep dim) vs integer (kill dim)
+
+```python
+points[1]      # int       → axis 0 dies         → 1D, size (2,)
+points[1:2]   # slice     → axis 0 kept (size 1) → 2D, size (1, 2)
+points[:, 1]  # all rows, col 1 → axis 1 dies   → 1D, size (3,)
+```
+
+For `points[:, 1]` (all rows, column 1):
+- Locked dim = column (`stride[1]=1, k=1`) → `storage_offset = 0 + 1*1 = 1`
+- Surviving dim = rows → `stride = (2,)`, `size = (3,)`
+
+```
+storage:  [ 4.0 , 1.0 , 5.0 , 3.0 , 2.0 , 1.0 ]
+                ▲           ▲           ▲
+                start       jump 2      jump 2
+                (offset=1)  →           →
+              last_col[0] last_col[1] last_col[2]
+                = 1.0       = 3.0       = 1.0
+```
+
+### Views Share Storage — Mutations Propagate
+
+Slices are **views**. Writing through a view writes to the shared storage. The parent tensor sees it.
+
+```python
+second_point = points[1]
+second_point[0] = 10.0      # writes through to shared storage
+points
+# tensor([[ 4.,  1.],
+#         [10.,  3.],   ← changed
+#         [ 2.,  1.]])
+```
+
+Two tensors, one buffer:
+```
+points ─┐
+        ├──► Storage S   (any write through either side mutates both)
+sliced ─┘
+```
+
+### `.clone()` Breaks the Link
+
+`.clone()` allocates a **brand-new storage**, copies the data in, and returns a tensor pointing at the new buffer. The two tensors are now fully independent.
+
+```
+Before clone:                 After .clone():
+
+points ─┐                     points ──► Storage A
+        ├──► Storage S
+sliced ─┘                     cloned ──► Storage B   (independent)
+```
+
+```python
+second_point = points[1].clone()
+second_point[0] = 10.0
+points          # unchanged
+```
+
+### When to Reach for `.clone()`
+
+- You need an **independent copy** for in-place modification.
+- You're returning a slice from a function and don't want the caller mutating the parent.
+- You see an `inplace operation modified` autograd error and you actually need a fresh buffer.
+
+### Two Worlds — Don't Mix Them Up
+
+```
+TENSOR WORLD                         STORAGE WORLD
+multi-dim, what you write            flat 1D buffer, what RAM holds
+─────────────────────────            ──────────────────────────
+points[2, 1]   (tensor index)        storage[5]   (storage index)
+second_point[1]                      storage[3]
+```
+
+A **tensor index** is a tuple of per-axis coords. A **storage index** is a single integer 0..N-1. The formula above is the bridge between them.
+
+---
+
+## 15. Transpose & Contiguity (from Ch. 3.9.2)
+
+### Transpose = Stride Swap (no copy)
+
+`tensor.t()` (2D shorthand for `transpose(0, 1)`) returns a new view that **shares storage** with the original. Only `size` and `stride` are swapped; the buffer is untouched.
+
+```
+                  before .t()              after .t()
+                  ───────────              ──────────
+   storage        SHARED ◄──────────────── SAME (no copy)
+   storage_offset 0                        0
+   size           (3, 2)                   (2, 3)        swapped
+   stride         (2, 1)                   (1, 2)        swapped
+```
+
+Generalizes: `transpose(d1, d2)` for any tensor swaps `size[d1]↔size[d2]` and `stride[d1]↔stride[d2]`. `.t()` is the 2D shortcut.
+
+### Why Stride-Swap = Transpose
+
+`stride[d]` is the jump-per-step along dim `d`. After swapping strides, "moving along axis 0" now jumps the way columns used to, and "moving along axis 1" jumps the way rows used to. That **is** a transpose.
+
+```
+        same storage:  [ 4.0 , 1.0 , 5.0 , 3.0 , 2.0 , 1.0 ]
+                         ┬────┬────┬────┬────┬────┬────
+
+points (3×2) stride (2,1):     points_t (2×3) stride (1,2):
+walk row-major                 walk column-major over the original
+row0: 0,1                      row0: 0,2,4   ← [4, 5, 2]
+row1: 2,3                      row1: 1,3,5   ← [1, 3, 1]
+row2: 4,5
+```
+
+### Double Transpose Returns the Original Metadata
+
+```
+points         shape (3, 2)   stride (2, 1)
+points.t()     shape (2, 3)   stride (1, 2)    ← swap
+points.t().t() shape (3, 2)   stride (2, 1)    ← swap again → matches points exactly
+```
+
+Two swaps cancel — same offset, size, stride, storage as the original.
+
+### Contiguous — The Real Rule
+
+A tensor is **contiguous** when its elements are packed in storage in natural reading order (last axis varies fastest, no gaps).
+
+> **Rule (general):** `stride[d] = size[d+1] * size[d+2] * ... * size[N-1]`, with `stride[N-1] = 1`.
+>
+> **Rule (2D shape `(R, C)`):** contiguous stride = `(C, 1)`. **Row-stride equals the number of columns**, not "column-stride + 1."
+
+```
+shape (3, 2) contiguous → stride (2, 1)   ← jump 2 to skip a row of 2 cols
+shape (3, 5) contiguous → stride (5, 1)   ← jump 5 to skip a row of 5 cols
+shape (R, C) contiguous → stride (C, 1)
+```
+
+### Common False Heuristic (Don't Use)
+
+> ✗ "Row-stride is 1 more than column-stride."
+
+Coincidence on `(3, 2)`. Fails on `(3, 5)` (`5-1=4`), `(3, 100)` (`100-1=99`), etc. Stick to **row-stride = #columns**.
+
+### Why Transpose Is Non-Contiguous
+
+```
+points   (3, 2) stride (2, 1)   contiguous? need (2, 1).  ✓ YES
+points_t (2, 3) stride (1, 2)   contiguous? need (3, 1).  ✗ NO  (row-stride 1 ≠ #cols 3)
+```
+
+Transposing a contiguous tensor **always** produces a non-contiguous view (unless one of the axes has size 1).
+
+### The Hidden Cost of Free Transpose
+
+Free transpose isn't truly free — the price is layout. Many ops require contiguous memory:
+
+```python
+points_t.view(6)              # ❌ RuntimeError: view size is not compatible
+                              #    with input tensor's size and stride
+points_t.contiguous().view(6) # ✓  .contiguous() copies into a packed buffer
+```
+
+| Op | Requires contiguous? |
+|----|----------------------|
+| `.view()` | **Yes** |
+| `.reshape()` | No (will copy if needed) |
+| Most arithmetic (`+`, `*`, etc.) | No |
+| Many low-level / fused kernels | Often yes |
+
+`.contiguous()` is the escape hatch — it allocates a fresh row-packed Storage and copies elements into reading order. After it, `stride` matches the contiguous formula.
+
+### Mental Model: Two Ways to Walk One Buffer
+
+The transpose isn't a new array. It's a **different walking rule** over the same array. Storage is the road; stride tells you which direction you're driving.
+
+---
+
+## 16. Higher-Dim Transpose & Contiguous Stride Formula (from Ch. 3.9.3)
+
+### `transpose(d1, d2)` for any rank
+
+`tensor.transpose(d1, d2)` swaps axes `d1` and `d2`, leaving all other axes alone. It's a **position-wise swap** on `size` and `stride`:
+
+```
+size[d1]  ↔ size[d2]
+stride[d1] ↔ stride[d2]
+all other entries: unchanged
+```
+
+`tensor.t()` is the 2D shorthand for `transpose(0, 1)`. For higher ranks, use `transpose(d1, d2)` or `permute(...)` (general re-ordering).
+
+### Contiguous Stride Formula — General Form
+
+> **`stride[d]` = product of all sizes to the right of `d`.**
+>
+> `stride[N-1] = 1`, then build leftward by multiplying.
+
+In plain English: to skip one step along axis `d`, you must jump over **everything that lies inside** that axis (all the dims to the right of it).
+
+```
+                   d            d+1   d+2   ...   N-1
+stride[d] =   1   ×   size[d+1] × size[d+2] × ... × size[N-1]
+```
+
+### Worked Examples
+
+```
+shape (3, 2)        → stride (2, 1)
+                     stride[1] = 1
+                     stride[0] = size[1] = 2
+
+shape (3, 4, 5)     → stride (20, 5, 1)
+                     stride[2] = 1
+                     stride[1] = size[2] = 5
+                     stride[0] = size[1]*size[2] = 4*5 = 20
+
+shape (2, 3, 4, 5)  → stride (60, 20, 5, 1)
+                     stride[3] = 1
+                     stride[2] = size[3] = 5
+                     stride[1] = size[2]*size[3] = 4*5 = 20
+                     stride[0] = size[1]*size[2]*size[3] = 3*4*5 = 60
+```
+
+### The Slab Picture (3D)
+
+A `(3, 4, 5)` tensor = **3 slabs**, each slab = **4 rows × 5 columns**, all packed in storage:
+
+```
+[ ─── slab 0 (20 cells) ─── ][ ─── slab 1 (20 cells) ─── ][ ─── slab 2 (20 cells) ─── ]
+
+within each slab: 4 rows of 5 cells each, packed
+within each row:  5 cells, adjacent
+
+  step 1 along axis 2 (column): jump 1   →  stride[2] = 1
+  step 1 along axis 1 (row):    jump 5   →  stride[1] = 5  (= one row's width)
+  step 1 along axis 0 (slab):   jump 20  →  stride[0] = 20 (= one slab's size)
+```
+
+### Higher-Dim Transpose Example
+
+```
+some_t      = torch.ones(3, 4, 5)
+              shape = (3, 4, 5),    stride = (20, 5, 1)
+
+some_t.transpose(0, 2):
+              swap size[0]↔size[2]:    shape  = (5, 4, 3)
+              swap stride[0]↔stride[2]: stride = ( 1, 5, 20)
+
+  Note: axis 1 (size 4, stride 5) is unchanged — it wasn't named in the swap.
+```
+
+### Contiguity Check (any rank)
+
+Compute the contiguous stride for the *current* shape using the formula, then compare to the actual stride:
+
+```
+some_t.transpose(0, 2):
+  current shape         = (5, 4, 3)
+  contiguous would be   = (12, 3, 1)    ← (4*3, 3, 1)
+  actual                = ( 1, 5, 20)
+  mismatch  →  NON-CONTIGUOUS
+```
+
+### Definition of Contiguous (book's wording)
+
+> A tensor is **contiguous** if its values are laid out in storage starting from the **rightmost dimension** and moving outward.
+
+Practically: last axis varies fastest, fully packed, no gaps. CPUs and GPUs read sequential memory faster than scattered memory — that's the **performance** benefit of contiguity (data locality).
+
+### Mental Shortcut
+
+Transposing a freshly contiguous tensor **always** yields non-contiguous output (unless one of the swapped axes has size 1). Two transposes that cancel (e.g. `t().t()`) restore the original metadata exactly.
+
+---
+
+## 17. Saving Tensors to Disk (from Ch. 3.13.1 — HDF5 with h5py)
+
+### Two Persistence Options in PyTorch
+
+| Option | Format | When to use |
+|---|---|---|
+| `torch.save(t, path)` / `torch.load(path)` | PyTorch-native pickle | PyTorch-only workflow. Fast round-trip. |
+| **HDF5 via `h5py`** | Open scientific format | (a) Other tools/languages need to read it. (b) **Dataset is bigger than RAM.** |
+
+### The Killer Feature: Lazy Disk Access
+
+HDF5 lets you **open a file without loading the data**. You only read what you ask for, when you ask for it. Critical for files larger than your RAM.
+
+```
+file on disk                   handle in Python                 result in RAM
+────────────                   ────────────────                 ─────────────
+big array       ◄─ open ─►     dset = f['coords']              0 bytes
+of numbers                     (knows shape, type,
+                                where data lives)
+
+                ◄─ slice ─►    dset[-2:]                        only those rows
+                               (h5py seeks + reads
+                                just those bytes)
+```
+
+### The Write Flow
+
+```python
+import h5py
+points = torch.tensor([[4.0, 1.0], [5.0, 3.0], [2.0, 1.0]])
+
+f = h5py.File('ourpoints.hdf5', 'w')
+dset = f.create_dataset('coords', data=points.numpy())   # 'coords' is the key
+f.close()
+```
+
+- `points.numpy()` is **zero-copy** — same buffer, new metadata wrapper.
+- HDF5 stores the bytes under the key `'coords'` (you can have many keys, even nested).
+
+### The Read Flow
+
+```python
+f = h5py.File('ourpoints.hdf5', 'r')   # 1. Open. Nothing read yet.
+dset = f['coords']                      # 2. Get handle to the 'coords' array.
+                                        #    Still nothing in RAM.
+last_points = torch.from_numpy(dset[-2:])  # 3. Read just last 2 rows from disk → RAM,
+                                           #    then COPY into PyTorch storage.
+f.close()                               # 4. Close. dset becomes invalid.
+```
+
+After step 4: `last_points` survives (it has its own copy). `dset[0]` raises an exception (its file is closed).
+
+### `.numpy()` ↔ `from_numpy()` — Zero-Copy Bridge
+
+A `numpy.ndarray` is also metadata over a flat 1D buffer — same model as a PyTorch tensor.
+
+```
+PyTorch tensor                NumPy array
+   │                              │
+   │   metadata                   │   metadata
+   │                              │
+   └──── same flat buffer ────────┘
+         [4.0, 1.0, 5.0, 3.0, ...]
+```
+
+- **`tensor.numpy()`** — zero-copy, shares buffer. Mutations propagate.
+- **`torch.from_numpy(arr)`** — usually zero-copy, shares buffer. Mutations propagate.
+
+### When `from_numpy(...)` Actually COPIES (the HDF5 case)
+
+The book says `torch.from_numpy(dset[-2:])` *does* copy. Two reasons:
+
+1. **Disk-to-RAM crossing.** `dset[-2:]` is the moment data is first read from disk into a fresh NumPy buffer. That step itself is a copy — disk bytes → RAM bytes. Unavoidable.
+2. **Buffer lifetime is tied to the file.** The buffer h5py returns belongs to h5py and dies when `f.close()` is called. If PyTorch shared it (zero-copy), your tensor would point at freed memory after close. So PyTorch copies into its own storage so the tensor outlives the file.
+
+```
+disk file                    h5py-owned buffer            tensor storage
+─────────       read         (dies on f.close)            (independent)
+big array  ──────────────►   [5.0, 3.0, 2.0, 1.0]  ──►   [5.0, 3.0, 2.0, 1.0]
+                              (temporary)                  (survives close)
+```
+
+### Handle vs. Copy — The Mental Distinction
+
+The whole section turns on this distinction:
+
+| | What it is | Survives `f.close()`? |
+|---|---|---|
+| `dset` (h5py dataset) | A **handle** that re-reads the file on every access | **No** — dies with the file |
+| `last_points` (PyTorch tensor) | A **copy** of the data in RAM | **Yes** — independent |
+
+**Rule:** Anything you want to use after closing the file must be a copy in RAM, not a handle.
+
+---
+
+## 18. Precision Rules (Lessons from Mistakes)
 
 - "Faster" is vague — faster to *compile* or faster to *run*? Be specific.
 - Autodiff ≠ training. Autodiff is one of four steps.
@@ -644,3 +1106,34 @@ No architecture code is "zebra-specific" or "horse-specific." All domain knowled
 - Model and inputs must be on the **same device** — forgetting this is the most common PyTorch runtime error.
 - `strength=0` preserves the original; `strength=1` ignores it. Middle values blend.
 - Seed the generator when iterating on prompts — otherwise, you can't tell if a change came from your prompt or from random variation.
+- A Tensor is metadata over a Storage, not a block of numbers: `(storage, storage_offset, size, stride)`.
+- **Stride is a jump size**, not a coordinate. `stride[d]` = positions in storage to skip per step in dim d.
+- **Tensor index ≠ storage index.** Tensor index is a tuple of per-axis coords; storage index is a single int. The formula `storage_offset + Σ stride[d]*index[d]` is the bridge.
+- Integer indexing (`x[1]`) **kills** the axis; slicing (`x[1:2]`) **keeps** it with size 1. Predictable shape change.
+- A slice/view shares the parent's Storage. Mutations propagate. `.clone()` allocates a fresh Storage and breaks the link.
+- Slicing is `O(1)` regardless of tensor size — only metadata changes, no data is copied.
+- `storage_offset` advances by `stride[d] * k` when you pick integer `k` along dim `d`. So `points[:, 1]` has offset `1`, not `0`.
+- "Spooky" mutation bug: `batch = big_tensor[0]; batch += 1.0` mutates `big_tensor`. Fix: `.clone()`.
+- **Transpose is metadata-only** — `.t()` swaps `size` and `stride`, leaves storage untouched. `id(a.storage()) == id(a.t().storage())`.
+- `.t()` is shorthand for `.transpose(0, 1)` and **only** works on 2D. Use `.transpose(d1, d2)` (or `.permute(...)`) for higher-rank tensors.
+- **Stride-swap = transpose** because stride is "jumps in storage per step." Swapping the jump-rules swaps the axes. No data moves.
+- Double transpose `t().t()` returns the original metadata exactly — same storage, offset, size, stride.
+- **Contiguous rule (2D, shape `(R, C)`):** stride = `(C, 1)`. Row-stride **equals number of columns**.
+- **Don't use the "off-by-1" heuristic** for contiguity — it's a coincidence on `(3, 2)` and breaks for any other shape.
+- Transposing a contiguous tensor produces a **non-contiguous** view (unless an axis has size 1).
+- Non-contiguous tensors work for arithmetic but break ops that require packed memory (notably `.view()`). Use `.contiguous()` to copy into a row-packed buffer.
+- `.reshape()` is "smart" — copies if needed. `.view()` is "strict" — errors on non-contiguous. Pick based on whether you want a guaranteed view or a guaranteed result.
+- **`transpose(d1, d2)` only swaps the two named positions** in `size` and `stride`. Other axes are untouched. It is **not** a full reversal of the tuple.
+- For full axis re-ordering use `permute(...)`. `.t()` is 2D-only shorthand for `transpose(0, 1)`.
+- **Contiguous stride formula:** `stride[d]` = product of all sizes to the right of `d`; `stride[N-1] = 1`. Build leftward by multiplying.
+- Trick to remember the formula: "to skip one step along axis `d`, you must jump over everything that lies *inside* that axis."
+- For shape `(R, C)` the formula gives `(C, 1)`. For `(D₀, D₁, D₂)` it gives `(D₁·D₂, D₂, 1)`. Generalizes to any rank.
+- Definition of contiguous (book): values laid out from the **rightmost dim outward**, packed tight. Last axis varies fastest in storage.
+- Why contiguity matters for performance: sequential memory reads are dramatically faster than scattered reads on real CPUs/GPUs (data locality).
+- Transposing a contiguous tensor produces a non-contiguous view **except** when one of the swapped axes has size 1 (size-1 axis is "trivial" — its stride doesn't affect layout).
+- **Tensors and NumPy arrays use the same model:** metadata over a flat 1D buffer. `.numpy()` and `from_numpy()` are zero-copy bridges across the two libraries.
+- **Pick persistence by audience.** `torch.save/load` for PyTorch-only. **HDF5** when you need other tools/languages or your dataset doesn't fit in RAM.
+- HDF5's killer feature is **lazy disk access**: open a file without loading it; index into it to pull only the bytes you need. Essential for datasets larger than RAM.
+- An h5py `dset` is a **handle**, not a copy. It depends on the open file. After `f.close()`, accessing it raises an exception.
+- **Copy vs handle survival:** anything you want to use after `f.close()` must be a copy in RAM (e.g., `torch.from_numpy(dset[...])`), not a raw handle.
+- `torch.from_numpy(dset[-2:])` copies (unlike a normal `from_numpy`) because (a) disk→RAM is a copy by definition, and (b) the source buffer's life is tied to the open file.
